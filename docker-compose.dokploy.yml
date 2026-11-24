@@ -1,0 +1,85 @@
+# OpenReply on Dokploy (project "tools"): web + worker + cron share one image; own Postgres and Redis.
+# Domain is attached in Dokploy to service "web", port 3000. Secrets come from the Dokploy env (.env).
+
+x-app: &app
+  build: .
+  image: openreply-app:dokploy
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql://openreply:${POSTGRES_PASSWORD}@postgres:5432/openreply
+    REDIS_URL: redis://redis:6379
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  networks: [default]
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: openreply
+      POSTGRES_USER: openreply
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - openreply-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openreply"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    mem_limit: 512m
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - openreply-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    mem_limit: 256m
+
+  web:
+    <<: *app
+    command: ["sh", "-c", "npx prisma migrate deploy && exec npm run start"]
+    expose: ["3000"]
+    networks: [default, dokploy-network]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(() => process.exit(0), () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    mem_limit: 768m
+
+  worker:
+    <<: *app
+    command: ["npm", "run", "worker"]
+    mem_limit: 512m
+
+  cron:
+    <<: *app
+    command: ["sh", "scripts/cron.sh"]
+    environment:
+      DATABASE_URL: postgresql://openreply:${POSTGRES_PASSWORD}@postgres:5432/openreply
+      REDIS_URL: redis://redis:6379
+      CRON_BASE_URL: http://web:3000
+    depends_on:
+      web:
+        condition: service_healthy
+    mem_limit: 256m
+
+networks:
+  dokploy-network:
+    external: true
+
+volumes:
+  openreply-pg:
+  openreply-redis:
